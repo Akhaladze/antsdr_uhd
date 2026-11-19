@@ -46,12 +46,12 @@
 
 /* microphase */
 /*
- * UDP ports for the E310 communication
+ * UDP ports for ANTSDR-E200 and ANTSDR-E310V2 communication
  * ports 49200 - 49210
  * */
 
 /* microphase */
-enum microphase_produce_t {E310 ,E200 ,ETTUS};
+enum class antsdr_product_t { E200, E310V2, UNKNOWN };
 
 enum b200_product_t { B200, B210, B200MINI, B205MINI };
 
@@ -90,6 +90,8 @@ typedef struct {
     uint8_t board_version[8];
 } microphase_ant_ctrl_data_t;
 
+class ant_device_process_lock;
+
 static const uint8_t ANT_FW_COMPAT_NUM_MAJOR = 8;
 static const uint8_t ANT_FW_COMPAT_NUM_MINOR = 0;
 static const uint16_t B200_FPGA_COMPAT_NUM    = 16;
@@ -113,6 +115,11 @@ static const uint32_t ANT_TX_MSG1_SID  = FLIP_SID(ANT_TX_DATA1_SID);
 
 static const uint32_t ANT_RX_DATA0_SID = 0x000000A0;
 static const uint32_t ANT_RX_DATA1_SID = 0x000000B0;
+
+// Source-flow-control packets share the radio control SID prefix. The low
+// two SID bits select the flow-control input inside radio_legacy.
+static const uint32_t ANT_RX_FC0_SID = 0x00000011;
+static const uint32_t ANT_RX_FC1_SID = 0x00000021;
 
 static const uint32_t ANT_TX_GPS_UART_SID = 0x00000030;
 static const uint32_t ANT_RX_GPS_UART_SID = FLIP_SID(ANT_TX_GPS_UART_SID);
@@ -146,14 +153,18 @@ public:
     static uhd::usrp::mboard_eeprom_t get_mb_eeprom(uhd::i2c_iface::sptr);
 
 private:
-    /* microphase product */
-    microphase_produce_t _product_mp;
+    /* ANTSDR product handled by this Ethernet driver (not Ettus E3XX). */
+    antsdr_product_t _antsdr_product;
     b200_product_t _product;
     size_t _revision;
     bool _gpsdo_capable;
     //! This flag is true if the FPGA has custom (user) registers and access to
     // those needs to be enabled from software.
     const bool _enable_user_regs;
+
+    // Held for the complete lifetime of this device object. Declared before
+    // transports/controllers so it is released only after they are destroyed.
+    std::unique_ptr<ant_device_process_lock> _device_process_lock;
 
     // controllers
     radio_ctrl_core_3000::sptr _local_ctrl;
@@ -357,13 +368,33 @@ private:
         size_t last_seq_ack;
         uhd::transport::bounded_buffer<size_t> seq_queue;
         std::shared_ptr<async_md_type> async_queue;
-        std::shared_ptr<async_md_type> old_async_queue;
+    };
+
+    struct rx_fc_cache_t
+    {
+        rx_fc_cache_t(uhd::transport::zero_copy_if::sptr xport_, const uint32_t sid_)
+            : xport(xport_)
+            , sid(sid_)
+            , last_seq(0)
+            , fc_packet_count(0)
+            , initialized(false)
+        {
+        }
+
+        uhd::transport::zero_copy_if::sptr xport;
+        const uint32_t sid;
+        uint32_t last_seq;
+        uint32_t fc_packet_count;
+        bool initialized;
+        std::mutex mutex;
     };
 
     //rx connect
     void _program_dispatcher(uhd::transport::zero_copy_if& xport);
 
     static size_t _get_tx_flow_control_window(size_t payload_size,size_t hw_buff_size);
+    static void _send_rx_flow_control(
+        boost::shared_ptr<rx_fc_cache_t> fc_cache, const size_t packet_count);
     typedef boost::function<double(void)> tick_rate_retriever_t;
     static void _handle_tx_async_msgs(boost::shared_ptr<tx_fc_cache_t> fc_cache,
                                       uhd::transport::zero_copy_if::sptr xport,
